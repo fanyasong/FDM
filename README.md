@@ -19,7 +19,13 @@
 
 **FDM decode memory is strictly O(1)** — fixed at 867 MB regardless of prompt length.
 Transformer KV cache grows linearly from 853 MB to 4,247 MB at N=8,192.
+## 📊 O(1) Memory vs. Transformer
 
+![Decode Memory Comparison](fig2_inference.png)
+
+*(FDM maintains a flat 867MB memory footprint during decoding, completely eliminating the OOM issues plaguing modern LLM deployment.)*
+
+---
 ---
 
 ## 🚀 Quick Start
