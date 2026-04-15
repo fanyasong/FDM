@@ -1,0 +1,31 @@
+# Large files
+*.pt
+*.pth
+data/
+*.fa.gz
+
+# Logs and results
+logs/*.txt
+results/
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# LaTeX aux
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.bbl
+*.blg
+
+# OS
+.DS_Store
+
+# Keep
+!checkpoints/README.md
+!logs/.gitkeep
+!results/.gitkeep

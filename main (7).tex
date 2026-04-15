@@ -1,0 +1,753 @@
+\documentclass{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{bbm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+
+% Fix citation superscript — avoids font corruption with times
+\newcommand{\citenum}[1]{%
+  \textsuperscript{\rmfamily\upshape[#1]}}
+
+% Figures uploaded as PDF to Overleaf root directory
+\graphicspath{{./}}
+
+\title{\textbf{A Wave-Cache Architecture with Phase-Aware Training\\
+for Language and Genomic Sequence Modeling}}
+
+\author{
+  Yasong Fan\\
+  Independent Researcher\\
+  \texttt{arXiv: 2604.07716} $\cdot$ \texttt{github.com/YasongFan/FDM}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+%------------------------------------------------------------------
+\begin{abstract}
+Sequence modeling architectures face a fundamental tension between
+global state propagation and selective local retrieval, yet most
+approaches couple these functions within a single operator.
+We introduce the Fan Duality Model (FDM), which explicitly separates
+these functions into a \emph{wave channel}---implementing
+norm-preserving recurrent propagation via Givens-rotation phase
+operators---and a \emph{cache channel}, implementing sparse associative
+retrieval over a fixed set of $W$ local and $K$ global slots independent
+of sequence length $N$.
+This separation yields a fixed-capacity historical state and measured
+runtime memory saturation beyond moderate context lengths, in contrast
+to the linear theoretical growth of Transformer KV-cache requirements
+(measured incremental memory saturates beyond moderate context lengths).
+
+A central empirical finding is that jointly training these two channels
+produces a \emph{gradient sink}: scan parameters dominate gradient flow,
+leaving the cache undertrained.
+We introduce \emph{phase-aware staged training}, in which the wave
+channel is frozen during an initial phase to allow the cache to
+specialise, with automatic transition triggered by a gradient-ratio
+criterion.
+This strategy substantially improves performance and indicates functional
+specialisation between channels: under our sequence-level mutual
+information estimator, the wave channel carries substantially more
+information than the cache channel with respect to the evaluated
+statistic, with cache attention concentrated in local distances
+(39\% within distance 16 tokens).
+
+On WikiText-103\citenum{1}, FDM achieves validation perplexity of 33.75
+under phase-aware training, below a similarly sized Transformer reference
+under the present training setup ($\sim$36--38).
+Pretrained on human hg38 (2.94\,Gbp), FDM achieves $0.945 \pm 0.001$
+on promoter recognition, $0.905 \pm 0.012$ and $0.775 \pm 0.002$ on
+two enhancer benchmarks, and $0.811 \pm 0.009$ on OCR prediction,
+compared with HyenaDNA\citenum{2} references of 0.856, 0.706, 0.711,
+and 0.806, respectively (three random seeds).
+Fine-tuning on ClinVar variant effect prediction yields
+AUC $= 0.861 \pm 0.011$ (zero-shot: 0.51; CADD: 0.869).
+Cross-species transfer to \emph{Drosophila} enhancer recognition yields
+AUC $= 0.792$, compared to 0.736 for a CNN trained from scratch.
+\end{abstract}
+
+%------------------------------------------------------------------
+\section{Introduction}
+
+Biological sequence modeling---and sequence modeling more broadly---requires
+integrating two distinct computational capacities: the propagation of
+distributional patterns across long distances, and the precise retrieval
+of specific past tokens on demand.
+Standard Transformers\citenum{3} address both through full self-attention,
+but the resulting linear growth in inference memory limits deployment on
+long sequences.
+Linear recurrent models such as S4\citenum{4}, Mamba\citenum{5}, and
+RWKV\citenum{6} achieve fixed-size inference memory through state
+compression, yet this compression involves an inherent structural tension:
+a single linear operator cannot simultaneously act as a norm-preserving
+global integrator (retaining all historical signal) and a selective filter
+(discarding irrelevant content on demand).
+We frame this as a tension between norm-preserving global propagation and
+selective retention of sparse facts, and use it as the motivating
+observation for architectural separation.
+
+FDM resolves this structural tension by architectural separation.
+The wave channel handles norm-preserving propagation; the cache channel
+handles selective retrieval.
+This decomposition is not merely architectural---jointly training these
+channels produces a gradient sink effect in which scan parameters
+dominate gradient flow, leaving the cache severely undertrained.
+We introduce a phase-aware staged training strategy that freezes the
+wave channel during an initial training phase, forcing gradient signal
+through the cache circuit before joint optimisation resumes.
+
+In language modeling, FDM achieves perplexity of 33.75 on
+WikiText-103\citenum{1}, below a similarly sized Transformer reference
+($\sim$36--38), with measured runtime memory saturating at moderate
+context lengths.
+Mutual information analysis indicates that the wave channel encodes
+global sequence-level information while the cache channel develops
+locality-biased retrieval patterns, consistent with the intended
+functional separation.
+
+We further apply FDM to genomic sequence modeling, where the
+fixed-capacity memory characteristic allows processing of longer
+regulatory sequences on a single GPU.
+A model pretrained on 2.94\,Gbp of human reference genome achieves
+consistent improvement over HyenaDNA\citenum{2} across all four genomic
+benchmarks evaluated (mean AUC +0.089 on promoter recognition, +0.199
+on enhancer classification).
+Fine-tuning on ClinVar variant effect data approaches CADD, a tool
+built on manually curated features.
+Cross-species transfer experiments indicate partial generalisation to
+\emph{Drosophila} regulatory elements.
+
+The main contributions are:
+(1) the FDM architecture with fixed-capacity historical state, motivated by
+the structural tension between norm-preserving propagation and selective
+retention;
+(2) phase-aware staged training, which addresses the gradient sink problem
+and substantially improves performance and functional channel separation;
+(3) systematic evaluation across language and genomic sequence modeling
+tasks with clear characterisation of task boundaries.
+
+%------------------------------------------------------------------
+\section{Related Work}
+
+\paragraph{Linear recurrent models.}
+S4\citenum{4}, Mamba\citenum{5}, Mamba-2\citenum{7}, RWKV\citenum{6},
+and RetNet\citenum{8} achieve fixed inference memory via recurrent state
+compression.
+FDM extends this family with explicit wave--cache separation.
+Relative to Mamba's selective state space mechanism, FDM separates global
+propagation from local retrieval architecturally rather than through
+input-dependent gating of a single state.
+
+\paragraph{KV cache compression.}
+H2O\citenum{9} and StreamingLLM\citenum{10} apply post-hoc heuristics
+to compress Transformer KV caches.
+FDM's cache learns selection end-to-end via the $s_\mathrm{eff}$ signal.
+Longformer\citenum{11} and BigBird\citenum{12} implement
+local$+$global attention patterns in full attention; FDM implements
+analogous patterns within a linear recurrent framework with
+$O(W{+}K)$ memory.
+
+\paragraph{DNA language models.}
+HyenaDNA\citenum{2} applies a Hyena convolution operator to genomic
+sequences at long sequence lengths.
+Nucleotide Transformer\citenum{13} and DNABERT-2\citenum{14} apply
+BERT-style pretraining to DNA.
+Evo\citenum{15} scales Hyena-based pretraining to multi-billion parameter
+models on prokaryotic genomes.
+FDM differs in its explicit wave--cache decomposition and in operating on
+eukaryotic human reference sequence.
+
+\paragraph{Staged training.}
+Curriculum learning\citenum{16} and progressive training strategies have
+been applied in various domains.
+Phase-aware training is most closely related to the observation that
+induction heads form in a two-phase process\citenum{17}; we observe an
+analogous phenomenon in FDM.
+
+%------------------------------------------------------------------
+\section{Method}
+
+\subsection{Architecture Overview}
+
+An overview of the architecture and training procedure is shown in
+Figure~\ref{fig:arch}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig1_architecture}
+\caption{
+  \textbf{FDM architecture and phase-aware training.}
+  Input tokens are processed by $L$ stacked layers, each comprising a
+  wave channel (norm-preserving Givens-rotation scan) and a cache channel
+  (sparse attention over $W$ local and $K$ global slots). Channel outputs
+  are combined via a learned gate. Phase-aware training proceeds in two
+  stages: Phase~0 freezes wave parameters, forcing gradient flow through
+  the cache circuit; Phase~1 resumes joint optimisation after automatic
+  transition at step~23{,}000.
+}
+\label{fig:arch}
+\end{figure}
+
+FDM processes tokens $x_1, \ldots, x_T$ through $L$ stacked layers,
+each comprising a wave channel and a cache channel.
+The wave channel output $h_t$ and cache channel output $c_t$ are combined
+via a learned gate:
+\begin{equation}
+  x_t^{(l+1)} = h_t^{(l)} + g_t^{(l)} \odot c_t^{(l)},
+  \quad
+  g_t^{(l)} = \sigma\!\left(W_g h_t^{(l)}\right) \in (0,1)^D.
+\end{equation}
+
+\subsection{Wave Channel}
+
+The wave channel implements the Fan Operator, a two-pass linear recurrent
+scan with phase-preserving Givens rotations.
+The first pass computes:
+\begin{equation}
+  h_t^{(1)} = (1 - p_t) \odot R(\theta_t) \cdot h_{t-1}
+              + p_t \odot \bigl(W_r x_t + i\, W_i x_t\bigr),
+\end{equation}
+where $R(\theta_t) \in \mathbb{C}^{D \times D}$ is a unitary rotation
+via $n_G$ Givens pairs satisfying $\|R(\theta)h\| = \|h\|$, and
+$p_t \in (0, 0.5]$:
+\begin{align}
+  s_\mathrm{eff}(t) &= \beta_t \cdot \log(t+2)
+    + W_\mathrm{pos}[\sin(\pi t/T),\, \cos(\pi t/T)]^\top, \\
+  p_t &= \sigma\!\left(s_\mathrm{eff}(t) + \mu\right) \cdot 0.5
+         + \varepsilon.
+\end{align}
+A second pass applies a perturbative correction (Born approximation)
+sharing all weights with the first, yielding $h_t = h_t^{(2)} + \Delta_\mathrm{gate} \cdot x_t$;
+full equations are given in Supplementary~S3.
+
+\subsection{Cache Channel}
+
+The cache channel applies sparse attention over $W$ local and $K$ global
+positions:
+\begin{align}
+  \mathrm{mask}(i,j) &= \mathrm{local}(i,j) \vee \mathrm{global}(i,j),\\
+  \mathrm{local}(i,j)
+    &= \mathbbm{1}\!\left[\max(0,i{-}W) \le j < i\right], \\
+  \mathrm{global}(i,j)
+    &= \mathbbm{1}\!\left[j \in
+       \mathrm{TopK}(\{s_\mathrm{eff}(k) : k < i\},\, K)\right].
+\end{align}
+Global slot selection reuses $s_\mathrm{eff}$ without additional
+parameters.
+Since $W$ and $K$ are constants independent of $N$, the cache size is
+fixed at $O(W{+}K)$.
+Language model: $W = 256$, $K = 16$; genomic model: $W = 128$, $K = 32$.
+
+\subsection{Phase-Aware Staged Training}
+
+Joint optimisation produces a gradient sink: $\Phi_\mathrm{wave}$
+dominates gradient magnitude, starving $\Phi_\mathrm{cache}$.
+
+\textbf{Phase~0.}
+$\Phi_\mathrm{wave}$ is frozen; $\Phi_\mathrm{cache}$ is optimised at
+$\eta_0 = 10^{-4}$.
+
+\textbf{Automatic transition.}
+\begin{equation}
+  \|\nabla_\mathrm{embed}\| \;/\;
+  \mathrm{mean}\!\left(
+    \|\nabla_{W_q}\|, \|\nabla_{W_k}\|, \|\nabla_{W_v}\|\right)
+  > \alpha \quad (\alpha = 1.2).
+\end{equation}
+
+\textbf{Phase~1.}
+All parameters jointly optimised at $\eta_1 = 3 \times 10^{-5}$.
+Transition occurs at step~23{,}000 in language modeling experiments;
+PPL decreases from 36.8 to 33.75 over the remaining 17{,}000 steps.
+
+\subsection{Genomic Pretraining and Fine-tuning}
+
+Pretrained autoregressively on hg38 (chromosomes 1--7, 9--16, 18--22, X;
+2.94\,Gbp; chromosome~8 excluded).
+Vocabulary: \{A, T, G, C, N\}.
+$d = 512$, 8~layers, 95{,}000 steps, sequence length~512, batch~8;
+validation PPL $= 3.23$.
+Fine-tuning: first~4 layers and embedding frozen; upper~4 layers and a
+two-layer head optimised via AdamW ($\mathrm{lr} = 5 \times 10^{-5}$,
+cosine schedule, patience~4).
+
+%------------------------------------------------------------------
+\section{Results}
+
+\subsection{Language Modeling}
+
+\begin{table}[h]
+\centering
+\caption{WikiText-103 validation perplexity. All FDM variants share
+the same architecture; the Transformer reference uses matched training
+data, sequence length, and optimiser.}
+\label{tab:lm}
+\begin{tabular}{lccc}
+\toprule
+Model & Params & Steps & Val PPL $\downarrow$ \\
+\midrule
+Transformer (reference) & $\sim$137M & 42K & $\sim$36--38 \\
+FDM --- joint training  & 137M & 42K & 487.5 \\
+FDM --- Freeze-Scan (Phase~0 only) & 137M & 44K & 64.9 \\
+FDM --- phase-aware (full) & 137M & 40K & \textbf{33.75} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{fig2_lm}
+\caption{
+  \textbf{Language modeling results on WikiText-103.}
+  \textbf{(A)}~Training dynamics: joint baseline remains unstable
+  throughout training; phase-aware FDM converges steadily, with the
+  dashed line marking the Transformer reference ($\sim$36--38~PPL).
+  The vertical dotted line marks the automatic phase transition at
+  step~23{,}000.
+  \textbf{(B)}~Validation PPL by training configuration. Phase-aware
+  training reduces PPL from 487.5 to 33.75, below the Transformer
+  reference. All variants share the same architecture; differences
+  reflect optimisation strategy under the present setup.
+}
+\label{fig:lm}
+\end{figure}
+
+Joint training (PPL $= 487.5$) is the gradient sink baseline.
+Phase~0 alone reaches 64.9; full phase-aware training reaches 33.75,
+below the Transformer reference.
+Transition at step~23{,}000 is automatic ($\alpha = 1.2$; PPL $= 36.8$
+at transition).
+The comparison primarily reflects differences in optimisation behaviour
+and model design under the present setup.
+Competitive SSM baselines trained on substantially larger corpora are not
+directly comparable; see Section~\ref{sec:discussion}.
+
+\begin{table}[h]
+\centering
+\caption{Freeze-Scan component ablation.}
+\label{tab:ablation}
+\begin{tabular}{lc}
+\toprule
+Configuration & Val PPL $\downarrow$ \\
+\midrule
+Baseline (joint)               & 487.5 \\
+$+$ Freeze-Scan (Phase~0)      & 64.9  \\
+$+$ $W_\mathrm{content}$ gate  & 60.8  \\
+$+$ Recall loss                & 55.7  \\
+$+$ Adaptive $\theta$          & 46.8  \\
+$+$ Phase~1 joint              & \textbf{33.75} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Runtime memory increment (MB) vs.\ sequence length.
+FDM increment remains approximately constant above $N = 2{,}048$.}
+\label{tab:memory}
+\begin{tabular}{lcc}
+\toprule
+$N$ & TF KV cache (MB) & FDM increment (MB) \\
+\midrule
+2,048  & 56.6    & $+$396.9 \\
+4,096  & 113.2   & $+$396.9 \\
+16,384 & 453.0   & $+$396.9 \\
+65,536 & 1,811.9 & $+$396.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $N = 65{,}536$, FDM requires $4.6\times$ less incremental memory.
+
+\subsection{Wave--Cache Functional Analysis}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{fig3_analysis}
+\caption{
+  \textbf{Wave--cache functional analysis.}
+  \textbf{(A)}~Mutual information between channel representations and a
+  sequence-level surprisal statistic (MINE estimator). The wave channel
+  carries substantially more information than the cache channel under
+  this statistic.
+  \textbf{(B)}~Cache attention mass by token distance, showing a
+  locality bias (39\% within distance~16).
+  \textbf{(C)}~Wave channel phase parameter $\theta$ (mean~$\pm$~std)
+  across layers. Values cluster near $\theta \approx 0.50$
+  ($\lambda \approx 12.5$ tokens) with no significant layer-to-layer
+  variation, indicating operation at a single temporal scale rather than
+  an emergent multi-scale hierarchy.
+}
+\label{fig:analysis}
+\end{figure}
+
+The wave channel carries $\mathrm{MI} = 0.474$ nats with sequence-level
+surprisal statistics; the cache channel carries little measurable mutual
+information under the same statistic.
+Cache attention exhibits a locality bias: 39\% of attention mass falls
+within distance~16 tokens, decreasing monotonically to 5.2\% at
+128--256.
+Wave channel $\theta$ values cluster near 0.50 across all layers
+(effective wavelength $\lambda \approx 12.5$ tokens), indicating
+operation at a consistent temporal scale.
+
+\subsection{Genomic Benchmarks}
+
+\begin{table}[h]
+\centering
+\caption{Genomic benchmark AUC (mean $\pm$ std, 3 seeds).
+Tasks from \texttt{genomic\_benchmarks}\citenum{18}; protocol follows
+HyenaDNA\citenum{2}.}
+\label{tab:genomic}
+\begin{tabular}{lcccc}
+\toprule
+Task & Seq.\ len & FDM-HG38 & HyenaDNA & $\Delta$ \\
+\midrule
+human\_nontata\_promoters & 251\,bp
+  & $\mathbf{0.945 \pm 0.001}$ & 0.856 & $+$0.089 \\
+human\_enhancers\_ensembl & 479\,bp
+  & $\mathbf{0.905 \pm 0.012}$ & 0.706 & $+$0.199 \\
+human\_enhancers\_cohn    & 500\,bp
+  & $\mathbf{0.775 \pm 0.002}$ & 0.711 & $+$0.064 \\
+human\_ocr\_ensembl       & 330\,bp
+  & $\mathbf{0.811 \pm 0.009}$ & 0.806 & $+$0.005 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{fig4_genomic}
+\caption{
+  \textbf{Genomic sequence modeling results.}
+  \textbf{(A)}~AUC on four genomic\_benchmarks (mean~$\pm$~std, three
+  random seeds). FDM shows clear gains on promoter ($+$0.089) and
+  enhancer tasks ($+$0.064 to $+$0.199); OCR performance is
+  approximately competitive (near parity, $+$0.005).
+  The larger variance on \texttt{human\_enhancers\_ensembl}
+  (std~$= 0.012$) warrants caution.
+  \textbf{(B)}~Downstream transfer.
+  \emph{Top}: variant effect prediction on ClinVar (5-fold CV);
+  fine-tuned FDM (AUC~$= 0.861 \pm 0.011$) approaches CADD (0.869),
+  which uses manually curated features and cross-species conservation.
+  \emph{Bottom}: cross-species transfer to \emph{Drosophila} enhancer
+  recognition; human-pretrained FDM (0.792) outperforms a
+  from-scratch CNN (0.736).
+}
+\label{fig:genomics}
+\end{figure}
+
+FDM shows clear gains on promoter and enhancer tasks (AUC $+$0.089
+and $+$0.064 to $+$0.199 respectively), while remaining approximately
+competitive on OCR ($+$0.005, near parity).
+The larger variance on \texttt{human\_enhancers\_ensembl}
+(std $= 0.012$) warrants caution.
+Cross-chromosome generalisation (chr1--3 $\to$ chr19) yields
+FDM AUC $= 0.903$ vs.\ CNN $= 0.895$, confirming that results do
+not arise from chromosome-level memorisation.
+
+\subsection{Variant Effect Prediction}
+
+\begin{table}[h]
+\centering
+\caption{Variant effect prediction AUC (ClinVar chr17, 5-fold CV).
+CADD\citenum{19} uses manually curated features and cross-species
+conservation.}
+\label{tab:vep}
+\begin{tabular}{lc}
+\toprule
+Method & AUC \\
+\midrule
+FDM zero-shot            & 0.51 \\
+CADD (reference)         & 0.869 \\
+FDM fine-tuned (5-fold)  & $\mathbf{0.861 \pm 0.011}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fine-tuned FDM reaches AUC $= 0.861 \pm 0.011$, substantially above
+zero-shot performance (0.51) and approaching CADD (0.869).
+CADD incorporates manually curated genomic features and cross-species
+conservation scores; direct comparison should be interpreted accordingly.
+
+\subsection{Cross-Species Transfer}
+
+\begin{table}[h]
+\centering
+\caption{Cross-species transfer AUC (\emph{Drosophila} enhancers\citenum{20},
+$n = 6{,}914$).}
+\label{tab:cross}
+\begin{tabular}{lcc}
+\toprule
+Model & Species & AUC \\
+\midrule
+CNN (from scratch)           & \emph{Drosophila} & 0.736 \\
+FDM-HG38 (human pretrained)  & \emph{Drosophila} & \textbf{0.792} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Human-pretrained FDM achieves AUC $= 0.792$ vs.\ 0.736 for a
+from-scratch CNN ($+$0.057), consistent with partial transfer of
+regulatory sequence representations across species.
+A preliminary mouse (mm10) experiment yielded FDM $= 0.741$
+vs.\ CNN $= 0.718$ (577 samples; statistical power is limited).
+
+%------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{On the gradient sink and phase-aware training.}
+The 7.5$\times$ improvement from Phase~0 alone ($487.5 \to 64.9$)
+indicates the cache was severely undertrained, not that the architecture
+was fundamentally limited.
+Phase~1 provides further improvement ($64.9 \to 33.75$), confirming
+complementary rather than redundant phases.
+The gradient-ratio criterion provides an automatic trigger; its
+robustness is empirical and would benefit from theoretical analysis.
+
+\paragraph{On wave--cache functional divergence.}
+MI divergence (wave: 0.474\,nats, cache: $\sim$0) and cache locality
+bias are consistent with the intended decomposition but do not constitute
+proof of strict functional separation.
+Uniform $\theta$ across layers ($\lambda \approx 12.5$ tokens) indicates
+operation at a single temporal scale; hierarchical behaviour would
+require per-layer $\theta$ diversity, which we leave to future work.
+
+\paragraph{On the OCR result.}
+The near-parity on OCR (FDM: 0.811, HyenaDNA: 0.806) contrasts with
+larger gains elsewhere.
+We do not attribute this to architectural limitations with confidence;
+establishing a causal link requires controlled ablations not performed here.
+
+\paragraph{On the genomic--language gap.}
+FDM achieves PPL $= 33.75$ on WikiText-103 and PPL $= 3.23$ on hg38,
+suggesting the architecture transfers across sequence modalities.
+Competitive results at scale would require substantially larger corpora.
+
+\paragraph{Limitations.}
+(1)~$\alpha$ adds a hyperparameter; behaviour beyond 137M parameters is
+untested.
+(2)~$K = 32$ global slots constrain long-range retrieval.
+(3)~\texttt{enhancers\_ensembl} seed variance (std $= 0.012$) warrants
+further investigation.
+(4)~Cross-species results are preliminary.
+
+\paragraph{Architectural directions.}
+Uniform $W$ across layers and fixed $K$ are simplifying choices.
+Layer-wise $W$ increasing with depth---shallow layers for local motifs,
+deeper layers for longer context---is analogous to expanding receptive
+fields\citenum{21}.
+$K$ scaling with sequence length or task signal density could improve
+long-range utility.
+Both modifications require pretraining from scratch and are left to
+future work.
+
+%------------------------------------------------------------------
+\section{Conclusion}
+
+FDM decouples global state propagation from sparse local retrieval.
+The structural tension between norm-preserving propagation and selective
+retention motivates the architecture; the gradient sink problem motivates
+phase-aware training.
+On WikiText-103, FDM achieves perplexity 33.75---below our Transformer
+reference---with measured runtime memory saturating at moderate context
+lengths.
+FDM shows clear gains on promoter and enhancer benchmarks and remains
+competitive on OCR.
+Fine-tuning on variant effect prediction approaches a feature-engineered
+baseline.
+These results suggest that explicit functional decomposition, combined
+with training strategies that respect it, can yield competitive sequence
+models with more functionally interpretable channel specialisation.
+
+%------------------------------------------------------------------
+\section*{References}
+
+\begin{enumerate}\setlength{\itemsep}{1pt}\small
+
+\item Merity, S.\ et al.\ Pointer sentinel mixture models.
+      \textit{ICLR} (2017).
+
+\item Nguyen, E.\ et al.\ HyenaDNA: Long-range genomic sequence modeling
+      at single nucleotide resolution.
+      \textit{NeurIPS} (2023).
+
+\item Vaswani, A.\ et al.\ Attention is all you need.
+      \textit{NeurIPS} (2017).
+
+\item Gu, A., Goel, K.\ \& R\'{e}, C.\ Efficiently modeling long sequences
+      with structured state spaces. \textit{ICLR} (2022).
+
+\item Gu, A.\ \& Dao, T.\ Mamba: Linear-time sequence modeling with
+      selective state spaces. \textit{arXiv}:2312.00752 (2023).
+
+\item Peng, B.\ et al.\ RWKV: Reinventing RNNs for the Transformer era.
+      \textit{EMNLP} (2023).
+
+\item Dao, T.\ \& Gu, A.\ Transformers are SSMs: Generalized models and
+      efficient algorithms. \textit{ICML} (2024).
+
+\item Sun, Y.\ et al.\ Retentive network: A successor to Transformer.
+      \textit{arXiv}:2307.08621 (2023).
+
+\item Zhang, Z.\ et al.\ H2O: Heavy-hitter oracle for efficient
+      generative inference. \textit{NeurIPS} (2023).
+
+\item Xiao, G.\ et al.\ Efficient streaming language models with
+      attention sinks. \textit{ICLR} (2024).
+
+\item Beltagy, I., Peters, M.\ E.\ \& Cohan, A.\ Longformer: The
+      long-document Transformer. \textit{arXiv}:2004.05150 (2020).
+
+\item Zaheer, M.\ et al.\ Big Bird: Transformers for longer sequences.
+      \textit{NeurIPS} (2020).
+
+\item Dalla-Torre, H.\ et al.\ The Nucleotide Transformer.
+      \textit{bioRxiv} (2023).
+
+\item Zhou, Z.\ et al.\ DNABERT-2: Efficient foundation model for
+      multi-species genomes. \textit{arXiv}:2306.15006 (2023).
+
+\item Nguyen, E.\ et al.\ Sequence modeling and design from molecular
+      to genome scale with Evo. \textit{Science} (2024).
+
+\item Bengio, Y.\ et al.\ Curriculum learning. \textit{ICML} (2009).
+
+\item Olsson, C.\ et al.\ In-context learning and induction heads.
+      \textit{Transformer Circuits Thread} (2022).
+
+\item Gre\v{s}ov\'{a}, K.\ et al.\ Genomic benchmarks.
+      \textit{BMC Genomic Data} (2023).
+
+\item Rentzsch, P.\ et al.\ CADD: Predicting deleteriousness of variants
+      throughout the human genome.
+      \textit{Nucleic Acids Research} (2019).
+
+\item Stark, A.\ et al.\ Discovery of functional elements in 12
+      \textit{Drosophila} genomes.
+      \textit{Nature} \textbf{450}, 219--232 (2007).
+
+\item He, K.\ et al.\ Deep residual learning for image recognition.
+      \textit{CVPR} (2016).
+
+\end{enumerate}
+
+%------------------------------------------------------------------
+\appendix
+\section*{Supplementary Information}
+
+\subsection*{S1.\ Query-Conditioned Wave State Modulation}
+
+\emph{Auxiliary extension; not part of primary claims.}
+
+\begin{equation}
+  h_\mathrm{mod} = h_t \odot \bigl(1 + \tanh(W_\mathrm{ref} x_t)\bigr).
+\end{equation}
+Zero-initialisation of $W_\mathrm{ref}$ ensures $h_\mathrm{mod} = h_t$
+at initialisation.
+Multi-head orthogonal variant:
+\begin{equation}
+  h_\mathrm{mod} = h_t \odot \frac{1}{H}
+    \sum_{i=1}^{H} \bigl(1 + \tanh(W_{\mathrm{ref},i} x_t)\bigr),\quad
+  \mathcal{L}_\mathrm{orth} = \lambda \sum_{i \ne j}
+    \|W_{\mathrm{ref},i} W_{\mathrm{ref},j}^\top\|_F^2.
+\end{equation}
+Modulation benefit concentrates in layer~0 ($\Delta\mathrm{PPL} = -1.36$),
+diminishing rapidly in deeper layers.
+
+\begin{table}[h]
+\centering
+\caption{Query-conditioned modulation ablation (starting PPL $= 64.9$).}
+\label{tab:modulation}
+\begin{tabular}{lc}
+\toprule
+Configuration & $\Delta$PPL \\
+\midrule
+Single-head, layer~0                & $-1.82$ \\
+4-head orthogonal, layer~0          & $-2.13$ \\
+8-head orthogonal, layer~0          & $\approx -2.1$ \\
+Sequential layerwise (layers~0--11) & $-1.58$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{S2.\ MQAR Associative Recall (Auxiliary)}
+
+The following is a synthetic auxiliary experiment included for completeness;
+it is not part of the primary claims.
+Easy setting (sequence length~64, 8~KV pairs, vocabulary~512):
+FDM $K=16$ accuracy $= 0.966$; Transformer $= 0.606$;
+wave-only ($K=0$) $= 0.011$.
+The near-zero wave-only score directly demonstrates that the cache
+component is necessary for precise associative recall under this task,
+complementing the mutual information analysis in the main text.
+
+
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\linewidth]{supp_memory}
+\caption{
+  \textbf{Runtime memory saturation of FDM under increasing context
+  length.}
+  FDM measured incremental memory remains approximately constant above
+  $N = 2{,}048$ (396.9\,MB), whereas the Transformer KV cache grows
+  linearly with sequence length (theoretical).
+  At $N = 65{,}536$, FDM requires $4.6\times$ less incremental memory.
+}
+\label{fig:memory}
+\end{figure}
+
+\subsection*{S3.\ Training Details}
+
+\textbf{Language model.}
+$d = 576$, 12~layers, $n_G = 4$, $K = 16$, $W = 256$.
+AdamW ($\beta_1=0.9$, $\beta_2=0.999$, wd$=0.01$).
+Phase~0: lr$=10^{-4}$, steps~0--23{,}000.
+Phase~1: lr$=3\times10^{-5}$, steps~23{,}000--40{,}000.
+WikiText-103 (121M tokens). Hardware: single NVIDIA RTX~5090.
+
+\textbf{Genomic model.}
+$d = 512$, 8~layers, $n_G = 4$, $K = 32$, $W = 128$.
+AdamW, lr$=10^{-4}$, cosine decay, 95{,}000~steps.
+Fine-tuning: lr$=5\times10^{-5}$, patience~4, first~4 layers frozen.
+
+\subsection*{S4.\ Genomic Benchmark Details}
+
+Tasks from \texttt{genomic\_benchmarks}\citenum{18}, protocol follows
+HyenaDNA\citenum{2}.
+All results use checkpoint at step~54{,}000 (PPL~$=3.37$).
+Seeds: 42, 123, 456.
+
+\subsection*{S5.\ Cross-Species Experimental Details}
+
+\textit{Drosophila}: positive from \texttt{drosophila\_enhancers\_stark}
+\citenum{20} (chr2L/2R/3L/3R/chrX); balanced sampling
+(3{,}457$+$3{,}457).
+CNN baseline: 3-layer Conv1d (kernel~9) $+$ GAP $+$ 2-layer MLP.
+Mouse (mm10): 577~balanced samples after N-masking.
+
+\end{document}
