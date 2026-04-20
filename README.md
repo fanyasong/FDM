@@ -1,84 +1,31 @@
 # FDM: Fan Duality Model
 
-**A Wave-Cache Architecture with Phase-Aware Training for Language and Genomic Sequence Modeling**
+**A Wave-Cache Architecture for Genomic Sequence Modeling with Unsupervised Regulatory Signal Extraction**
 
+[![arXiv](https://img.shields.io/badge/arXiv-2604.07716-b31b1b.svg)](https://arxiv.org/abs/2604.07716)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1+-orange.svg)](https://pytorch.org/)
 
-> Chinese Patent No. 2026104740169
+Yasong Fan · Independent Researcher
 
 ---
 
 ## Overview
 
-FDM separates sequence processing into two dedicated channels:
+FDM separates global state propagation (wave channel) from sparse local retrieval (cache channel),
+achieving fixed O(1) inference memory independent of sequence length N.
+This enables whole-chromosome genomic scanning on a single GPU.
 
-- **Wave channel** — norm-preserving recurrent propagation via Givens-rotation phase operators
-- **Cache channel** — sparse associative retrieval over W local + K global slots, independent of sequence length N
+**Key results:**
 
-A central finding is that jointly training these two channels produces a **gradient sink**: scan parameters dominate gradient flow, leaving the cache severely undertrained. **Phase-aware staged training** resolves this.
-
-![FDM Architecture](assets/fig1_architecture.png)
-
-*Fig. 1: FDM architecture and phase-aware training. Wave and cache channels are combined via a learned gate. Phase 0 freezes wave parameters to allow cache specialisation; Phase 1 resumes joint optimisation after automatic transition at step 23,000.*
-
----
-
-## Results
-
-### Language Modeling
-
-![Language Modeling Results](assets/fig2_lm.png)
-
-*Fig. 2: (A) Training dynamics on WikiText-103. Phase-aware FDM converges to PPL=33.75, below the Transformer reference (~36–38). (B) PPL by configuration — joint training collapses to 487.5 due to the gradient sink.*
-
-| Model | Val PPL ↓ |
-|-------|-----------|
-| Transformer (reference, ~137M) | ~36–38 |
-| FDM — joint training | 487.5 |
-| FDM — Freeze-Scan (Phase 0 only) | 64.9 |
-| **FDM — phase-aware (full)** | **33.75** |
-
----
-
-### Wave–Cache Functional Analysis
-
-![Functional Analysis](assets/fig3_analysis.png)
-
-*Fig. 3: (A) Wave channel carries substantially more mutual information than cache channel. (B) Cache attention exhibits locality bias (39% within distance 16). (C) Wave θ is uniform across layers (λ ≈ 12.5 tokens) — no emergent multi-scale hierarchy.*
-
----
-
-### Genomic Benchmarks
-
-![Genomic Results](assets/fig4_genomic.png)
-
-*Fig. 4: (A) AUC on four genomic benchmarks (mean ± std, 3 seeds). Clear gains on promoter and enhancer tasks; near parity on OCR. (B) Variant effect prediction approaches CADD; cross-species transfer to Drosophila (+0.057 vs CNN from scratch).*
-
-**AUC (mean ± std, 3 seeds)**
-
-| Task | Seq. len | FDM-HG38 | HyenaDNA | Δ |
-|------|----------|----------|----------|---|
-| human_nontata_promoters | 251 bp | **0.945 ± 0.001** | 0.856 | +0.089 |
-| human_enhancers_ensembl | 479 bp | **0.905 ± 0.012** | 0.706 | +0.199 |
-| human_enhancers_cohn    | 500 bp | **0.775 ± 0.002** | 0.711 | +0.064 |
-| human_ocr_ensembl       | 330 bp | **0.811 ± 0.009** | 0.806 | +0.005 |
-
-**Variant Effect Prediction (ClinVar chr17, 5-fold CV)**
-
-| Method | AUC |
-|--------|-----|
-| FDM zero-shot | 0.51 |
-| CADD (reference) | 0.869 |
-| **FDM fine-tuned** | **0.861 ± 0.011** |
-
-**Cross-Species Transfer (Drosophila enhancers)**
-
-| Model | AUC |
-|-------|-----|
-| CNN from scratch | 0.736 |
-| **FDM-HG38 (human pretrained)** | **0.792** |
+| Experiment | Result |
+|---|---|
+| WikiText-103 PPL | 33.75 (Transformer ref ~36–38) |
+| Memory at N=65536 | 397 MB (Transformer: 1812 MB) |
+| Promoter AUC | 0.945 ± 0.001 (HyenaDNA: 0.856) |
+| chr22 cCRE enrichment | 4.81× (GC-controlled: 1.85×, p=8.39e-148) |
+| mm10 zero-shot | 5.80× (no mouse training) |
+| HiDRA r (L8) | 0.133, p=1.34e-05 (entropy baseline: 0.014) |
+| MPRA HepG2 GC-strat. r | 0.096 (n=61,463); K562: 0.110 (n=2,123) |
 
 ---
 
@@ -86,33 +33,27 @@ A central finding is that jointly training these two channels produces a **gradi
 
 ```
 FDM/
-├── README.md
-├── LICENSE
-├── requirements.txt
-│
-├── train_130m.py           # FDM language model + phase-aware training
-├── genomics_hg38.py        # Genomic model + hg38 pretraining
-├── triton_scan_v2.py       # Triton kernel for Givens-rotation scan
-├── genomic_multiseed.py    # Multi-seed genomic benchmark evaluation
-├── vep_finetune.py         # ClinVar variant effect prediction fine-tuning
-│
+├── fdm/
+│   ├── __init__.py
+│   ├── model.py            # FDM_Entropy_LM
+│   ├── layers.py           # EntropyCollapseBlock
+│   ├── ops.py              # Triton scan kernel
+│   └── rope.py             # RoPE
 ├── scripts/
-│   ├── pretrain_lm.sh      # Language model pretraining
-│   ├── pretrain_genomic.sh # Genomic pretraining on hg38
-│   └── eval_benchmarks.sh  # Run all genomic benchmarks
-│
-├── assets/                 # Figures for README
-│   ├── fig1_architecture.png
-│   ├── fig2_lm.png
-│   ├── fig3_analysis.png
-│   └── fig4_genomic.png
-│
-├── paper/
-│   ├── main.tex            # LaTeX source (Nature MI submission)
-│   └── cover_letter.pdf
-│
-└── checkpoints/
-    └── README.md           # Pretrained checkpoint download instructions
+│   ├── pretrain_entropy.py
+│   ├── pretrain_multitask.py
+│   └── finetune_genomic.py
+├── analysis/
+│   ├── compare_hidra.py    # Reproduce r=0.133
+│   ├── ccre_enrichment.py  # Reproduce cCRE enrichment
+│   ├── mpra_correlation.py # Reproduce MPRA r
+│   └── frozen_backbone.py  # Frozen backbone ATAC
+├── configs/
+│   ├── entropy_pretrain.yaml
+│   └── lm_wikitext.yaml
+├── generate_figs.py
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -125,81 +66,130 @@ cd FDM
 pip install -r requirements.txt
 ```
 
-**Requirements:** Python 3.10+, PyTorch 2.1+, Triton 3.0+, CUDA 12+
+Requirements: Python ≥ 3.10, PyTorch ≥ 2.1, CUDA ≥ 11.8, Triton ≥ 2.0
 
 ---
 
-## Usage
+## Pretrained Weights
 
-### Phase-Aware Language Model Training
+| Model | Params | Val PPL | Link |
+|---|---|---|---|
+| FDM-Entropy-hg38 | 29.5M | 3.88 (chr17) | HuggingFace (coming soon) |
+| FDM-Multitask-hg38 | 29.5M | 3.13 (chr17) | HuggingFace (coming soon) |
 
-```bash
-# Phase 0: freeze wave channel, train cache only (0–23K steps)
-python train_130m.py --phase 0 --steps 23000 --lr 1e-4 \
-  --data data/tokens_130m.pt --save checkpoints/fdm_phase0.pt
+```python
+from fdm import FDM_Entropy_LM
+import torch
 
-# Phase 1: joint optimisation (23K–40K steps)
-python train_130m.py --phase 1 --steps 40000 --lr 3e-5 \
-  --resume checkpoints/fdm_phase0.pt \
-  --save checkpoints/fdm_phase_aware.pt
-```
-
-### Genomic Pretraining on hg38
-
-```bash
-python genomics_hg38.py \
-  --genome_dir data/hg38_full/ --steps 95000 \
-  --d 512 --n_layers 8 --cache_k 32 --local_window 128 \
-  --save checkpoints/fdm_hg38.pt
-```
-
-### Benchmark Evaluation
-
-```bash
-python genomic_multiseed.py \
-  --checkpoint checkpoints/fdm_hg38_step54k.pt \
-  --seeds 42 123 456
-```
-
-### Reproduce Paper Figures
-
-```bash
-python figures/generate_figures.py
-# Outputs fig1–fig4 + supp_memory as PDF and PNG
+model = FDM_Entropy_LM()
+ckpt = torch.load("checkpoints/entropy_pretrain/best.pt", weights_only=False)
+model.load_state_dict(ckpt["model_state"], strict=False)
+model.eval()
 ```
 
 ---
 
-## Pretrained Checkpoints
+## Reproducing Key Results
 
-| Checkpoint | Val PPL | Description |
-|------------|---------|-------------|
-| `fdm_phase_aware_lm.pt` | 33.75 | Language model, WikiText-103 |
-| `fdm_hg38_step95k.pt`   | 3.23  | Genomic model, full hg38 pretraining |
-| `fdm_hg38_step54k.pt`   | 3.37  | Genomic model used in benchmark experiments |
+### r = 0.133 (HiDRA, Table 4)
 
-Hosted at `https://huggingface.co/YasongFan/FDM` (available upon paper publication).
-See `checkpoints/README.md` for loading instructions.
+```bash
+# Data: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE104001
+python analysis/compare_hidra.py \
+    --checkpoint checkpoints/entropy_pretrain/best.pt \
+    --hidra_bw data/GSE104001_HiDRA_RNAtoDNARatio_0.1Pseudocount.bw \
+    --region chr22:10500000-20000000
+# Expected: L8 r=0.133  p=1.34e-05  n=1137
+```
+
+### cCRE Enrichment (Table 3)
+
+```bash
+# ENCODE cCRE: https://www.encodeproject.org/annotations/ENCSR890HXX/
+python analysis/ccre_enrichment.py \
+    --checkpoint checkpoints/entropy_pretrain/best.pt \
+    --genome data/hg38/ \
+    --ccre data/encodeCcreCombined.bb \
+    --chroms chr1 chr17 chr22
+# Expected: chr22 4.81x; GC-controlled 1.85x p=8.39e-148
+```
+
+### MPRA Correlation (Table 5)
+
+```bash
+# Data: https://zenodo.org/records/10558183
+python analysis/mpra_correlation.py \
+    --checkpoint checkpoints/entropy_pretrain/best.pt \
+    --seq_table data/mpra/table_s3.xlsx \
+    --act_table data/mpra/table_s6.xlsx \
+    --cell_type HepG2
+# Expected: raw r=0.176  GC-stratified r=0.096  n=61463
+```
+
+### Frozen Backbone ATAC (Table 6)
+
+```bash
+# Data: https://www.encodeproject.org/files/ENCFF038DDS/
+python analysis/frozen_backbone.py \
+    --backbone checkpoints/entropy_pretrain/best.pt \
+    --atac_peaks data/atac/ENCFF038DDS.bed.gz \
+    --train_chrom chr22 --test_chrom chr17
+# Expected: AUC=0.727; p_t range L8=0.72 (preserved)
+```
+
+---
+
+## Training From Scratch
+
+### Entropy Architecture Pretraining
+
+```bash
+# hg38: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/
+python scripts/pretrain_entropy.py \
+    --genome_dir data/hg38/ \
+    --val_chrom chr17 \
+    --output_dir checkpoints/entropy_pretrain/ \
+    --steps 100000 --batch_size 8 --seq_len 512 --lr 3e-4
+# Hardware: 1x RTX 5090, ~12h  Expected PPL: ~3.88
+```
+
+### WikiText-103
+
+```bash
+python scripts/pretrain_lm.py \
+    --data_dir data/wikitext103/ \
+    --output_dir checkpoints/lm/ \
+    --phase0_steps 23000 --phase1_steps 17000
+# Expected PPL: 33.75
+```
+
+---
+
+## Data Sources
+
+| Dataset | Source | Usage |
+|---|---|---|
+| hg38 | UCSC | Pretraining |
+| ENCODE cCRE | ENCSR890HXX | cCRE enrichment |
+| GM12878 ATAC | ENCFF038DDS | ATAC prediction |
+| HiDRA | GSE104001 | Enhancer activity (Wang et al. Nat. Commun. 2018) |
+| lentiMPRA | Zenodo 10558183 | MPRA (Agarwal et al. Nature 2025) |
+| PhyloP 100way | UCSC | Conservation |
 
 ---
 
 ## Citation
 
-Paper under review. If you use this code, please cite:
-
 ```bibtex
 @article{fan2026fdm,
-  title={A Wave-Cache Architecture with Phase-Aware Training
-         for Language and Genomic Sequence Modeling},
-  author={Fan, Yasong},
-  year={2026},
-  note={Preprint. Chinese Patent No. 2026104740169}
+  title   = {A Wave-Cache Architecture for Genomic Sequence Modeling
+             with Unsupervised Regulatory Signal Extraction},
+  author  = {Fan, Yasong},
+  journal = {arXiv preprint arXiv:2604.07716},
+  year    = {2026}
 }
 ```
 
----
-
 ## License
 
-MIT License — see [LICENSE](LICENSE).  
-Chinese Patent No. 2026104740169.
+MIT. See [LICENSE](LICENSE).

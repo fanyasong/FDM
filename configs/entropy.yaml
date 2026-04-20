@@ -1,0 +1,31 @@
+# FDM Entropy Architecture — Pretraining Hyperparameters
+# Reproduces: checkpoints/entropy_pretrain/best.pt  (step=100000, PPL=3.882)
+
+model:
+  d: 512
+  n_layers: 8
+  vocab_size: 6
+  p_scales:   [0.99, 0.50, 0.25, 0.125, 0.063, 0.031, 0.016, 0.004]
+  k_sizes:    [128,  64,   32,   16,    8,     4,     4,     4   ]
+  lw_sizes:   [8,    8,    16,   32,    64,    128,   256,   512  ]
+
+training:
+  seq_len: 512
+  batch_size: 8
+  steps: 100000
+  lr: 3.0e-4
+  warmup_steps: 2000
+  lr_schedule: cosine
+  dropout: 0.1
+  grad_clip: 1.0
+
+data:
+  genome: data/hg38_full/
+  val_chrom: chr17
+  train_chroms: [chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr9,chr10,
+                 chr11,chr12,chr13,chr14,chr15,chr16,chr18,chr19,
+                 chr20,chr21,chr22,chrX]
+
+hardware:
+  # Single NVIDIA RTX 5090 (32 GB VRAM)
+  # ~12 hours for 100,000 steps
